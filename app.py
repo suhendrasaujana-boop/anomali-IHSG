@@ -6,7 +6,9 @@ import plotly.graph_objects as go
 import numpy as np
 from datetime import datetime, date, timedelta
 import time
+import random
 from typing import Dict, List, Optional, Tuple, Any
+from plotly.subplots import make_subplots
 
 # ========== IMPORT OPSIONAL DENGAN PENANGANAN ERROR ==========
 try:
@@ -47,6 +49,7 @@ VOLUME_SPIKE_COOLDOWN_HOURS = 6
 st.set_page_config(layout="wide", page_title="Smart Market Dashboard", page_icon="📊")
 
 # ========== SESSION STATE ==========
+# Inisialisasi session state dengan aman
 if 'last_resistance' not in st.session_state:
     st.session_state.last_resistance = None
 if 'last_breakout_notify_time' not in st.session_state:
@@ -57,7 +60,6 @@ if 'last_volume_notify_time' not in st.session_state:
     st.session_state.last_volume_notify_time = None
 if 'portfolio' not in st.session_state:
     st.session_state.portfolio = []
-# Threshold yang bisa diubah user
 if 'user_volume_spike_threshold' not in st.session_state:
     st.session_state.user_volume_spike_threshold = VOLUME_SPIKE_THRESHOLD
 if 'user_breakout_cooldown_hours' not in st.session_state:
@@ -97,6 +99,21 @@ def should_notify_volume_spike(volume_ratio: float) -> bool:
         return True
     return False
 
+# Fungsi untuk notifikasi dengan fallback
+def show_notification(message: str, type: str = "toast", icon: str = "ℹ️"):
+    """Menampilkan notifikasi dengan fallback untuk versi Streamlit lama"""
+    if type == "toast" and hasattr(st, 'toast'):
+        st.toast(message, icon=icon)
+    else:
+        if type == "success":
+            st.success(message)
+        elif type == "warning":
+            st.warning(message)
+        elif type == "info":
+            st.info(message)
+        else:
+            st.info(message)
+
 def get_fundamental_details(ticker: str) -> Dict[str, Any]:
     try:
         obj = yf.Ticker(ticker)
@@ -123,7 +140,7 @@ def load_data(ticker: str, timeframe: str) -> pd.DataFrame:
         df = yf.download(ticker, period="2y", interval=timeframe, progress=False, auto_adjust=False)
         if df.empty:
             df = yf.download(ticker, period="1y", interval=timeframe, progress=False, auto_adjust=False)
-        if df.empty:
+        if df.empty or len(df) < 2:  # Minimal 2 baris
             return pd.DataFrame()
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -138,6 +155,8 @@ def load_data(ticker: str, timeframe: str) -> pd.DataFrame:
 @st.cache_data(ttl=SCANNER_CACHE_TTL)
 def scan_market_fast(tickers: List[str]) -> pd.DataFrame:
     try:
+        # Jeda acak untuk mengurangi rate limit
+        time.sleep(random.uniform(0.5, 1.5))
         all_data = yf.download(tickers, period="3mo", interval="1d", group_by="ticker", progress=False, threads=True, auto_adjust=False)
         rows = []
         for ticker in tickers:
@@ -235,7 +254,6 @@ def get_portfolio_current_prices(tickers: List[str]) -> Dict[str, Optional[float
     if not tickers:
         return {}
     try:
-        # Gunakan yf.Tickers untuk batch request
         tickers_obj = yf.Tickers(' '.join(tickers))
         prices = {}
         for t in tickers:
@@ -349,6 +367,8 @@ def get_news_sentiment():
 # ========== FITUR TAMBAHAN (UPGRADE) ==========
 @st.cache_data(ttl=CACHE_TTL)
 def get_multi_timeframe_trend(ticker):
+    # Jeda acak untuk mengurangi rate limit
+    time.sleep(random.uniform(0.2, 0.5))
     daily = load_data(ticker, "1d")
     weekly = load_data(ticker, "1wk")
     monthly = load_data(ticker, "1mo")
@@ -418,6 +438,7 @@ def get_macro_signal():
     except:
         return "Neutral", 1
 
+@st.cache_data(ttl=3600)  # Cache selama 1 jam
 def get_sector_rotation():
     sectors = {
         "Bank": ["BBRI.JK","BMRI.JK","BBCA.JK"],
@@ -539,7 +560,7 @@ if not data.empty:
     current_resistance = data['resistance'].iloc[-1]
     current_price = data['Close'].iloc[-1]
     if should_notify_breakout(current_price, current_resistance):
-        st.toast(f"🚀 BREAKOUT! Harga menembus resistance {current_resistance:.2f}", icon="🚀")
+        show_notification(f"🚀 BREAKOUT! Harga menembus resistance {current_resistance:.2f}", "toast", "🚀")
         st.session_state.last_resistance = current_resistance
         st.session_state.last_breakout_notify_time = datetime.now()
     
@@ -550,7 +571,7 @@ if not data.empty:
         if vol_ma > 0:
             volume_ratio = vol_last / vol_ma
             if should_notify_volume_spike(volume_ratio):
-                st.toast(f"🔥 Volume Spike! {volume_ratio:.1f}x", icon="⚠️")
+                show_notification(f"🔥 Volume Spike! {volume_ratio:.1f}x", "toast", "⚠️")
                 st.session_state.last_volume_ratio = volume_ratio
                 st.session_state.last_volume_notify_time = datetime.now()
 
@@ -590,40 +611,56 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
 
 # ========== TAB 1: GRAFIK ==========
 with tab1:
-    st.subheader("Candlestick Chart")
-    fig = go.Figure()
-    # Candlestick dengan hovertemplate
+    st.subheader("Candlestick Chart dengan Volume")
+    # Buat subplot untuk harga dan volume
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, 
+                        row_heights=[0.7, 0.3])
+    
+    # Candlestick
     fig.add_trace(go.Candlestick(x=data.index, open=data['Open'], high=data['High'],
                                  low=data['Low'], close=data['Close'], name="Price",
-                                 hovertemplate='Tanggal: %{x}<br>Open: %{open:.2f}<br>High: %{high:.2f}<br>Low: %{low:.2f}<br>Close: %{close:.2f}<extra></extra>'))
+                                 hovertemplate='Tanggal: %{x}<br>Open: %{open:.2f}<br>High: %{high:.2f}<br>Low: %{low:.2f}<br>Close: %{close:.2f}<extra></extra>'),
+                  row=1, col=1)
+    
+    # Indikator
     fig.add_trace(go.Scatter(x=data.index, y=data['SMA20'], name="SMA20",
-                             hovertemplate='SMA20: %{y:.2f}<extra></extra>'))
+                             hovertemplate='SMA20: %{y:.2f}<extra></extra>'),
+                  row=1, col=1)
     fig.add_trace(go.Scatter(x=data.index, y=data['SMA50'], name="SMA50",
-                             hovertemplate='SMA50: %{y:.2f}<extra></extra>'))
+                             hovertemplate='SMA50: %{y:.2f}<extra></extra>'),
+                  row=1, col=1)
     fig.add_trace(go.Scatter(x=data.index, y=data['support'], name="Support", line=dict(dash='dash'),
-                             hovertemplate='Support: %{y:.2f}<extra></extra>'))
+                             hovertemplate='Support: %{y:.2f}<extra></extra>'),
+                  row=1, col=1)
     fig.add_trace(go.Scatter(x=data.index, y=data['resistance'], name="Resistance", line=dict(dash='dash'),
-                             hovertemplate='Resistance: %{y:.2f}<extra></extra>'))
+                             hovertemplate='Resistance: %{y:.2f}<extra></extra>'),
+                  row=1, col=1)
     if 'BB_upper' in data.columns and not data['BB_upper'].isnull().all():
         fig.add_trace(go.Scatter(x=data.index, y=data['BB_upper'], name="BB Upper", line=dict(dash='dot'),
-                                 hovertemplate='BB Upper: %{y:.2f}<extra></extra>'))
+                                 hovertemplate='BB Upper: %{y:.2f}<extra></extra>'),
+                      row=1, col=1)
         fig.add_trace(go.Scatter(x=data.index, y=data['BB_lower'], name="BB Lower", line=dict(dash='dot'),
-                                 hovertemplate='BB Lower: %{y:.2f}<extra></extra>'))
+                                 hovertemplate='BB Lower: %{y:.2f}<extra></extra>'),
+                      row=1, col=1)
+    
+    # Volume bar chart
+    fig.add_trace(go.Bar(x=data.index, y=volume, name="Volume", marker_color='lightblue',
+                         hovertemplate='Volume: %{y:,.0f}<extra></extra>'),
+                  row=2, col=1)
+    
+    fig.update_layout(height=800, title_text=f"{ticker} - Candlestick & Volume", showlegend=True)
+    fig.update_xaxes(title_text="Tanggal", row=2, col=1)
+    fig.update_yaxes(title_text="Harga", row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
+    
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Volume")
-    if volume.sum() > 0:
-        st.bar_chart(volume)
-    else:
-        st.info("Volume tidak tersedia untuk indeks")
-
+    st.subheader("RSI (14) & MACD")
     col_r, col_m = st.columns(2)
     with col_r:
-        st.subheader("RSI (14)")
         st.line_chart(data['RSI'])
         st.caption("RSI < 35: Oversold | >70: Overbought")
     with col_m:
-        st.subheader("MACD")
         st.line_chart(data[['MACD', 'MACD_signal']])
         st.caption("MACD > Signal: Bullish")
 
@@ -1081,17 +1118,17 @@ with tab6:
         if fund:
             col1, col2 = st.columns(2)
             with col1:
-                st.metric("PER (TTM)", f"{fund['pe']:.2f}" if fund['pe'] else "N/A")
-                st.metric("PBV", f"{fund['pb']:.2f}" if fund['pb'] else "N/A")
-                st.metric("Dividend Yield", f"{fund['div_yield']*100:.2f}%" if fund['div_yield'] else "N/A")
-                st.metric("Market Cap", f"{fund['market_cap']/1e12:.2f}T" if fund['market_cap'] else "N/A")
+                st.metric("PER (TTM)", f"{fund['pe']:.2f}" if pd.notna(fund['pe']) else "N/A")
+                st.metric("PBV", f"{fund['pb']:.2f}" if pd.notna(fund['pb']) else "N/A")
+                st.metric("Dividend Yield", f"{fund['div_yield']*100:.2f}%" if pd.notna(fund['div_yield']) else "N/A")
+                st.metric("Market Cap", f"{fund['market_cap']/1e12:.2f}T" if pd.notna(fund['market_cap']) else "N/A")
                 st.metric("Sektor", fund['sector'] if fund['sector'] else "N/A")
             with col2:
-                st.metric("ROA", f"{fund['roa']*100:.2f}%" if fund['roa'] else "N/A")
-                st.metric("ROE", f"{fund['roe']*100:.2f}%" if fund['roe'] else "N/A")
-                st.metric("Debt to Equity", f"{fund['debt_to_equity']:.2f}" if fund['debt_to_equity'] else "N/A")
-                st.metric("Profit Margin", f"{fund['profit_margin']*100:.2f}%" if fund['profit_margin'] else "N/A")
-                st.metric("Revenue Growth (YoY)", f"{fund['revenue_growth']*100:.2f}%" if fund['revenue_growth'] else "N/A")
+                st.metric("ROA", f"{fund['roa']*100:.2f}%" if pd.notna(fund['roa']) else "N/A")
+                st.metric("ROE", f"{fund['roe']*100:.2f}%" if pd.notna(fund['roe']) else "N/A")
+                st.metric("Debt to Equity", f"{fund['debt_to_equity']:.2f}" if pd.notna(fund['debt_to_equity']) else "N/A")
+                st.metric("Profit Margin", f"{fund['profit_margin']*100:.2f}%" if pd.notna(fund['profit_margin']) else "N/A")
+                st.metric("Revenue Growth (YoY)", f"{fund['revenue_growth']*100:.2f}%" if pd.notna(fund['revenue_growth']) else "N/A")
         else:
             st.info("Data fundamental tidak tersedia untuk ticker ini.")
     else:
