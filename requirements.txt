@@ -1,1 +1,9 @@
 streamlit
+yfinance
+pandas
+numpy
+ta
+plotly
+scikit-learn
+feedparser
+textblob
