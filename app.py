@@ -429,10 +429,16 @@ def get_sector_rotation():
         returns = []
         for t in tickers:
             try:
-                df = yf.download(t, period="5d", progress=False)['Close']
-                ret = (df.iloc[-1] - df.iloc[0]) / df.iloc[0]
-                returns.append(ret)
-            except:
+                df = yf.download(t, period="5d", progress=False, auto_adjust=False)
+                if df.empty:
+                    continue
+                # Pastikan kita mengambil kolom Close sebagai Series biasa
+                close = df['Close'].squeeze()
+                if len(close) < 2:
+                    continue
+                ret = (close.iloc[-1] - close.iloc[0]) / close.iloc[0]
+                returns.append(float(ret))   # paksa jadi float biasa
+            except Exception:
                 continue
 
         if returns:
@@ -443,7 +449,6 @@ def get_sector_rotation():
 
     best = max(sector_perf, key=sector_perf.get)
     return best, sector_perf
-
 def calculate_final_confidence(ai_score, smart_status, macro_status, best_sector, ticker):
     confidence = ai_score
 
