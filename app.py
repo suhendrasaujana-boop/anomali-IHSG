@@ -39,6 +39,7 @@ IHSG_BLUE_CHIPS = [
     "ADRO.JK", "ANTM.JK", "MDKA.JK", "UNTR.JK", "ICBP.JK",
     "INDF.JK", "UNVR.JK", "SMGR.JK", "CPIN.JK", "JPFA.JK"
 ]
+# Default threshold, nanti bisa diubah user di sidebar
 VOLUME_SPIKE_THRESHOLD = 1.8
 BREAKOUT_COOLDOWN_HOURS = 24
 VOLUME_SPIKE_COOLDOWN_HOURS = 6
@@ -56,6 +57,11 @@ if 'last_volume_notify_time' not in st.session_state:
     st.session_state.last_volume_notify_time = None
 if 'portfolio' not in st.session_state:
     st.session_state.portfolio = []
+# Threshold yang bisa diubah user
+if 'user_volume_spike_threshold' not in st.session_state:
+    st.session_state.user_volume_spike_threshold = VOLUME_SPIKE_THRESHOLD
+if 'user_breakout_cooldown_hours' not in st.session_state:
+    st.session_state.user_breakout_cooldown_hours = BREAKOUT_COOLDOWN_HOURS
 
 # ========== FUNGSI BANTU ==========
 def safe_sma(series: pd.Series, window: int) -> pd.Series:
@@ -76,13 +82,13 @@ def should_notify_breakout(current_price: float, resistance: float) -> bool:
         return True
     if st.session_state.last_breakout_notify_time is None:
         return True
-    cooldown = timedelta(hours=BREAKOUT_COOLDOWN_HOURS)
+    cooldown = timedelta(hours=st.session_state.user_breakout_cooldown_hours)
     if datetime.now() - st.session_state.last_breakout_notify_time > cooldown:
         return True
     return False
 
 def should_notify_volume_spike(volume_ratio: float) -> bool:
-    if volume_ratio <= VOLUME_SPIKE_THRESHOLD:
+    if volume_ratio <= st.session_state.user_volume_spike_threshold:
         return False
     if st.session_state.last_volume_notify_time is None:
         return True
@@ -224,38 +230,29 @@ def calculate_ai_score(df: pd.DataFrame, volume: pd.Series) -> int:
     ]
     return sum(conditions)
 
+# ========== PERBAIKAN: GET PORTFOLIO PRICES DENGAN YF.TICKERS ==========
 def get_portfolio_current_prices(tickers: List[str]) -> Dict[str, Optional[float]]:
     if not tickers:
         return {}
     try:
-        data = yf.download(tickers, period="1d", group_by='ticker', progress=False, auto_adjust=False)
+        # Gunakan yf.Tickers untuk batch request
+        tickers_obj = yf.Tickers(' '.join(tickers))
         prices = {}
-        missing = []
-        for tick in tickers:
+        for t in tickers:
             try:
-                if isinstance(data.columns, pd.MultiIndex):
-                    if tick in data.columns.levels[0]:
-                        prices[tick] = data[tick]['Close'].iloc[-1]
-                    else:
-                        missing.append(tick)
-                        prices[tick] = None
+                hist = tickers_obj.tickers[t].history(period="1d")
+                if not hist.empty:
+                    prices[t] = hist['Close'].iloc[-1]
                 else:
-                    if tick == data.columns.get_level_values(0)[0]:
-                        prices[tick] = data['Close'].iloc[-1]
-                    else:
-                        missing.append(tick)
-                        prices[tick] = None
+                    prices[t] = None
             except Exception:
-                missing.append(tick)
-                prices[tick] = None
-        if missing:
-            st.warning(f"Tidak dapat mengambil harga untuk: {', '.join(missing)}")
+                prices[t] = None
         return prices
     except Exception as e:
         st.error(f"Error fetching portfolio prices: {e}")
         return {t: None for t in tickers}
 
-# ========== BACKTEST (DITINGKATKAN) ==========
+# ========== BACKTEST ==========
 def backtest_strategy(df, initial_capital=1000000, rsi_buy=35, rsi_sell=70, sma_period=20, commission=0.001):
     """Backtest strategi dengan parameter custom dan komisi"""
     if df.empty or len(df) < 50:
@@ -298,7 +295,7 @@ def backtest_strategy(df, initial_capital=1000000, rsi_buy=35, rsi_sell=70, sma_
         'bh_return': bh_return
     }
 
-# ========== MACHINE LEARNING (DITINGKATKAN) ==========
+# ========== MACHINE LEARNING ==========
 def prepare_ml_features(df, lookback=5, target_pct=0.01):
     """Siapkan fitur dan target dengan fitur tambahan (momentum, volume change, ATR)"""
     if not SKLEARN_AVAILABLE:
@@ -350,6 +347,7 @@ def get_news_sentiment():
         return None
 
 # ========== FITUR TAMBAHAN (UPGRADE) ==========
+@st.cache_data(ttl=CACHE_TTL)
 def get_multi_timeframe_trend(ticker):
     daily = load_data(ticker, "1d")
     weekly = load_data(ticker, "1wk")
@@ -482,6 +480,24 @@ def calculate_final_confidence(ai_score, smart_status, macro_status, best_sector
     confidence = max(0, min(100, confidence))
     return confidence
 
+# ========== FUNGSI TERPUSAT UNTUK SEMUA SINYAL ==========
+def get_all_signals(df, volume, ticker):
+    """Menghasilkan semua sinyal dan skor dalam satu fungsi"""
+    ai_score = calculate_ai_score(df, volume)
+    smart_score, smart_status = calculate_smart_money(df)
+    macro_status, macro_score = get_macro_signal()
+    best_sector, _ = get_sector_rotation()
+    confidence = calculate_final_confidence(ai_score, smart_status, macro_status, best_sector, ticker)
+    return {
+        'ai_score': ai_score,
+        'smart_score': smart_score,
+        'smart_status': smart_status,
+        'macro_status': macro_status,
+        'macro_score': macro_score,
+        'best_sector': best_sector,
+        'confidence': confidence
+    }
+
 # ========== SIDEBAR ==========
 with st.sidebar:
     st.markdown("# 📊 Smart Market Dashboard")
@@ -490,6 +506,18 @@ with st.sidebar:
     if ticker != ticker_input:
         st.info(f"Format: {ticker}")
     timeframe = st.selectbox("Timeframe", list(TIMEFRAMES.keys()))
+    
+    st.markdown("### ⚙️ Pengaturan Alert")
+    user_volume_spike = st.slider("Volume spike multiplier", 1.0, 5.0, 
+                                  st.session_state.user_volume_spike_threshold, 0.1,
+                                  key="user_volume_spike_slider")
+    user_breakout_cooldown = st.number_input("Breakout cooldown (jam)", 1, 72, 
+                                             st.session_state.user_breakout_cooldown_hours,
+                                             key="user_breakout_cooldown_input")
+    # Simpan ke session state
+    st.session_state.user_volume_spike_threshold = user_volume_spike
+    st.session_state.user_breakout_cooldown_hours = user_breakout_cooldown
+    
     if st.button("🔄 Refresh Data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -564,15 +592,23 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
 with tab1:
     st.subheader("Candlestick Chart")
     fig = go.Figure()
+    # Candlestick dengan hovertemplate
     fig.add_trace(go.Candlestick(x=data.index, open=data['Open'], high=data['High'],
-                                 low=data['Low'], close=data['Close'], name="Price"))
-    fig.add_trace(go.Scatter(x=data.index, y=data['SMA20'], name="SMA20"))
-    fig.add_trace(go.Scatter(x=data.index, y=data['SMA50'], name="SMA50"))
-    fig.add_trace(go.Scatter(x=data.index, y=data['support'], name="Support", line=dict(dash='dash')))
-    fig.add_trace(go.Scatter(x=data.index, y=data['resistance'], name="Resistance", line=dict(dash='dash')))
+                                 low=data['Low'], close=data['Close'], name="Price",
+                                 hovertemplate='Tanggal: %{x}<br>Open: %{open:.2f}<br>High: %{high:.2f}<br>Low: %{low:.2f}<br>Close: %{close:.2f}<extra></extra>'))
+    fig.add_trace(go.Scatter(x=data.index, y=data['SMA20'], name="SMA20",
+                             hovertemplate='SMA20: %{y:.2f}<extra></extra>'))
+    fig.add_trace(go.Scatter(x=data.index, y=data['SMA50'], name="SMA50",
+                             hovertemplate='SMA50: %{y:.2f}<extra></extra>'))
+    fig.add_trace(go.Scatter(x=data.index, y=data['support'], name="Support", line=dict(dash='dash'),
+                             hovertemplate='Support: %{y:.2f}<extra></extra>'))
+    fig.add_trace(go.Scatter(x=data.index, y=data['resistance'], name="Resistance", line=dict(dash='dash'),
+                             hovertemplate='Resistance: %{y:.2f}<extra></extra>'))
     if 'BB_upper' in data.columns and not data['BB_upper'].isnull().all():
-        fig.add_trace(go.Scatter(x=data.index, y=data['BB_upper'], name="BB Upper", line=dict(dash='dot')))
-        fig.add_trace(go.Scatter(x=data.index, y=data['BB_lower'], name="BB Lower", line=dict(dash='dot')))
+        fig.add_trace(go.Scatter(x=data.index, y=data['BB_upper'], name="BB Upper", line=dict(dash='dot'),
+                                 hovertemplate='BB Upper: %{y:.2f}<extra></extra>'))
+        fig.add_trace(go.Scatter(x=data.index, y=data['BB_lower'], name="BB Lower", line=dict(dash='dot'),
+                                 hovertemplate='BB Lower: %{y:.2f}<extra></extra>'))
     st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Volume")
@@ -600,8 +636,10 @@ with tab1:
 
 # ========== TAB 2: AI SIGNAL ==========
 with tab2:
-    score = calculate_ai_score(data, volume)
-
+    # Gunakan fungsi terpusat untuk mendapatkan sinyal
+    all_signals = get_all_signals(data, volume, ticker)
+    score = all_signals['ai_score']
+    
     col_a, col_b = st.columns(2)
     with col_a:
         st.subheader("🤖 AI Score")
@@ -684,7 +722,7 @@ with tab2:
     with col_vol:
         st.subheader("🚨 Volume Alert")
         if volume.sum() > 0:
-            if volume.iloc[-1] > data['Volume_MA'].iloc[-1] * VOLUME_SPIKE_THRESHOLD:
+            if volume.iloc[-1] > data['Volume_MA'].iloc[-1] * st.session_state.user_volume_spike_threshold:
                 st.success("Volume Spike Detected")
             else:
                 st.write("Normal Volume")
@@ -792,7 +830,7 @@ with tab2:
         st.warning("⚠️ Weak Trend")
 
     st.subheader("🏦 Smart Money Flow")
-    smart_score, smart_status = calculate_smart_money(data)
+    smart_score, smart_status = all_signals['smart_score'], all_signals['smart_status']
     col1, col2 = st.columns(2)
     col1.metric("Smart Money Score", f"{smart_score}/4")
     col2.metric("Status", smart_status)
@@ -804,7 +842,7 @@ with tab2:
         st.info("Sideways / Neutral")
 
     st.subheader("🌍 Macro Market Filter")
-    macro_status, macro_score = get_macro_signal()
+    macro_status, macro_score = all_signals['macro_status'], all_signals['macro_score']
     col1, col2 = st.columns(2)
     col1.metric("Macro Condition", macro_status)
     col2.metric("Score", f"{macro_score}/3")
@@ -816,13 +854,14 @@ with tab2:
         st.info("Market Neutral")
 
     st.subheader("🔄 Sector Rotation")
-    best_sector, sector_data = get_sector_rotation()
+    best_sector = all_signals['best_sector']
     st.metric("Leading Sector", best_sector)
+    _, sector_data = get_sector_rotation()
     for sector, val in sector_data.items():
         st.write(f"{sector}: {val:.2%}")
 
     st.subheader("🎯 Final AI Confidence")
-    confidence = calculate_final_confidence(score, smart_status, macro_status, best_sector, ticker)
+    confidence = all_signals['confidence']
     st.metric("Confidence Score", f"{confidence}%")
     if confidence >= 75:
         st.success("🚀 High Probability Trade")
@@ -911,9 +950,13 @@ with tab4:
     else:
         st.info("Masukkan modal, risiko, dan stop loss untuk menghitung.")
 
-# ========== TAB 5: BACKTEST & ML (DITINGKATKAN) ==========
+# ========== TAB 5: BACKTEST & ML ==========
 with tab5:
     st.header("🧪 Backtesting & Machine Learning")
+    
+    # Peringatan jika volume tidak tersedia
+    if volume.sum() == 0:
+        st.warning("Data volume tidak tersedia – backtest dan ML akan menggunakan fitur terbatas.")
     
     # ========== BACKTEST DENGAN PARAMETER ==========
     st.subheader("📈 Backtest Strategi (RSI + SMA)")
