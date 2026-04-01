@@ -449,7 +449,7 @@ def get_sector_rotation():
 
     best = max(sector_perf, key=sector_perf.get)
     return best, sector_perf
-ddef calculate_final_confidence(ai_score, smart_status, macro_status, best_sector, ticker):
+def calculate_final_confidence(ai_score, smart_status, macro_status, best_sector, ticker):
     # Skala awal: AI Score dikalikan 10 (max 50)
     confidence = ai_score * 10
 
