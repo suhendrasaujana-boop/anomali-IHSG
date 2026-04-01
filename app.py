@@ -449,20 +449,21 @@ def get_sector_rotation():
 
     best = max(sector_perf, key=sector_perf.get)
     return best, sector_perf
-def calculate_final_confidence(ai_score, smart_status, macro_status, best_sector, ticker):
-    confidence = ai_score
+ddef calculate_final_confidence(ai_score, smart_status, macro_status, best_sector, ticker):
+    # Skala awal: AI Score dikalikan 10 (max 50)
+    confidence = ai_score * 10
 
     # Smart Money boost
     if smart_status == "Accumulation":
-        confidence += 10
+        confidence += 15
     elif smart_status == "Distribution":
-        confidence -= 10
+        confidence -= 15
 
     # Macro boost
     if macro_status == "Risk ON":
-        confidence += 5
+        confidence += 10
     elif macro_status == "Risk OFF":
-        confidence -= 5
+        confidence -= 10
 
     # Sector alignment
     sector_map = {
@@ -476,6 +477,7 @@ def calculate_final_confidence(ai_score, smart_status, macro_status, best_sector
         if ticker.replace(".JK","") in stocks and sector == best_sector:
             confidence += 5
 
+    # Pastikan dalam rentang 0–100
     confidence = max(0, min(100, confidence))
     return confidence
 
