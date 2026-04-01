@@ -57,7 +57,7 @@ if 'last_volume_notify_time' not in st.session_state:
 if 'portfolio' not in st.session_state:
     st.session_state.portfolio = []
 
-# ========== FUNGSI BANTU (SAMA PERSIS) ==========
+# ========== FUNGSI BANTU ==========
 def safe_sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window, min_periods=1).mean()
 
@@ -255,43 +255,52 @@ def get_portfolio_current_prices(tickers: List[str]) -> Dict[str, Optional[float
         st.error(f"Error fetching portfolio prices: {e}")
         return {t: None for t in tickers}
 
-# ========== FUNGSI BACKTEST, ML, SENTIMEN ==========
-def backtest_strategy(df, initial_capital=1000000):
-    """Backtest strategi RSI < 35 dan Close > SMA20"""
+# ========== BACKTEST (DITINGKATKAN) ==========
+def backtest_strategy(df, initial_capital=1000000, rsi_buy=35, rsi_sell=70, sma_period=20, commission=0.001):
+    """Backtest strategi dengan parameter custom dan komisi"""
     if df.empty or len(df) < 50:
-        return None  # data tidak cukup
+        return None
     df = df.copy()
-    # Hitung indikator
-    df['sma20'] = df['Close'].rolling(20).mean()
+    df['sma'] = df['Close'].rolling(sma_period).mean()
     df['rsi'] = ta.momentum.rsi(df['Close'], window=14)
-    # Sinyal beli: RSI < 35 dan Close > SMA20
-    df['buy_signal'] = (df['rsi'] < 35) & (df['Close'] > df['sma20'])
-    df['sell_signal'] = (df['rsi'] > 70) | (df['Close'] < df['sma20'])
-    # Simulasi
+    df['buy_signal'] = (df['rsi'] < rsi_buy) & (df['Close'] > df['sma'])
+    df['sell_signal'] = (df['rsi'] > rsi_sell) | (df['Close'] < df['sma'])
+    
     position = 0
     cash = initial_capital
     trades = []
+    equity_curve = [initial_capital]
+    
     for i in range(1, len(df)):
+        price = df['Close'].iloc[i]
         if df['buy_signal'].iloc[i] and position == 0:
-            position = cash / df['Close'].iloc[i]
+            position = cash / price
             cash = 0
-            trades.append(('BUY', df.index[i], df['Close'].iloc[i]))
+            trades.append(('BUY', df.index[i], price))
         elif df['sell_signal'].iloc[i] and position > 0:
-            cash = position * df['Close'].iloc[i]
+            cash = position * price * (1 - commission)
             position = 0
-            trades.append(('SELL', df.index[i], df['Close'].iloc[i]))
+            trades.append(('SELL', df.index[i], price))
+        total_value = cash + (position * price if position > 0 else 0)
+        equity_curve.append(total_value)
+    
     if position > 0:
-        cash = position * df['Close'].iloc[-1]
-    total_return = (cash - initial_capital) / initial_capital * 100
+        cash = position * df['Close'].iloc[-1] * (1 - commission)
+    final_capital = cash
+    total_return = (final_capital - initial_capital) / initial_capital * 100
+    bh_return = (df['Close'].iloc[-1] / df['Close'].iloc[0] - 1) * 100
     return {
-        'final_capital': cash,
+        'final_capital': final_capital,
         'total_return': total_return,
         'num_trades': len(trades),
-        'trades': trades
+        'trades': trades,
+        'equity_curve': equity_curve,
+        'bh_return': bh_return
     }
 
-def prepare_ml_features(df):
-    """Siapkan fitur dan target untuk ML (hanya jika sklearn tersedia)"""
+# ========== MACHINE LEARNING (DITINGKATKAN) ==========
+def prepare_ml_features(df, lookback=5, target_pct=0.01):
+    """Siapkan fitur dan target dengan fitur tambahan (momentum, volume change, ATR)"""
     if not SKLEARN_AVAILABLE:
         return None, None
     if df.empty or len(df) < 100:
@@ -303,13 +312,22 @@ def prepare_ml_features(df):
     df['volume_ma'] = df['Volume'].rolling(20).mean()
     df['ad'] = ta.volume.acc_dist_index(df['High'], df['Low'], df['Close'], df['Volume'], fillna=True)
     df['cmf'] = ta.volume.chaikin_money_flow(df['High'], df['Low'], df['Close'], df['Volume'], window=20, fillna=True)
-    # Target: kenaikan >1% dalam 5 hari
-    df['future_return'] = df['Close'].shift(-5) / df['Close'] - 1
-    df['target'] = (df['future_return'] > 0.01).astype(int)
+    # Fitur baru
+    df['momentum_5'] = df['Close'].pct_change(5)
+    df['volume_change'] = df['Volume'] / df['Volume'].rolling(20).mean() - 1
+    # ATR 14
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(14).mean()
+    # Target: kenaikan > target_pct dalam lookback hari
+    df['future_return'] = df['Close'].shift(-lookback) / df['Close'] - 1
+    df['target'] = (df['future_return'] > target_pct).astype(int)
     df = df.dropna()
     if len(df) < 50:
         return None, None
-    features = ['rsi', 'sma20', 'sma50', 'volume_ma', 'ad', 'cmf']
+    features = ['rsi', 'sma20', 'sma50', 'volume_ma', 'ad', 'cmf', 'momentum_5', 'volume_change', 'atr']
     X = df[features]
     y = df['target']
     return X, y
@@ -331,7 +349,7 @@ def get_news_sentiment():
     except Exception:
         return None
 
-# ========== FUNGSI TAMBAHAN (UPGRADE) ==========
+# ========== FITUR TAMBAHAN (UPGRADE) ==========
 def get_multi_timeframe_trend(ticker):
     daily = load_data(ticker, "1d")
     weekly = load_data(ticker, "1wk")
@@ -360,19 +378,12 @@ def calculate_smart_money(df):
 
     score = 0
 
-    # CMF accumulation
     if df['CMF'].iloc[-1] > 0:
         score += 1
-
-    # AD accumulation
     if df['AD'].iloc[-1] > df['AD'].iloc[-5]:
         score += 1
-
-    # Volume spike
     if df['Volume'].iloc[-1] > df['Volume_MA'].iloc[-1] * 1.5:
         score += 1
-
-    # Price above SMA20
     if df['Close'].iloc[-1] > df['SMA20'].iloc[-1]:
         score += 1
 
@@ -392,16 +403,10 @@ def get_macro_signal():
         nasdaq = yf.download("^IXIC", period="5d", progress=False)['Close']
 
         score = 0
-
-        # IHSG trend
         if ihsg.iloc[-1] > ihsg.mean():
             score += 1
-
-        # USD melemah = positif
         if usd.iloc[-1] < usd.mean():
             score += 1
-
-        # Nasdaq bullish
         if nasdaq.iloc[-1] > nasdaq.mean():
             score += 1
 
@@ -432,12 +437,11 @@ def get_sector_rotation():
                 df = yf.download(t, period="5d", progress=False, auto_adjust=False)
                 if df.empty:
                     continue
-                # Pastikan kita mengambil kolom Close sebagai Series biasa
                 close = df['Close'].squeeze()
                 if len(close) < 2:
                     continue
                 ret = (close.iloc[-1] - close.iloc[0]) / close.iloc[0]
-                returns.append(float(ret))   # paksa jadi float biasa
+                returns.append(float(ret))
             except Exception:
                 continue
 
@@ -449,23 +453,21 @@ def get_sector_rotation():
 
     best = max(sector_perf, key=sector_perf.get)
     return best, sector_perf
+
 def calculate_final_confidence(ai_score, smart_status, macro_status, best_sector, ticker):
     # Skala awal: AI Score dikalikan 10 (max 50)
     confidence = ai_score * 10
 
-    # Smart Money boost
     if smart_status == "Accumulation":
         confidence += 15
     elif smart_status == "Distribution":
         confidence -= 15
 
-    # Macro boost
     if macro_status == "Risk ON":
         confidence += 10
     elif macro_status == "Risk OFF":
         confidence -= 10
 
-    # Sector alignment
     sector_map = {
         "Bank": ["BBRI", "BMRI", "BBCA"],
         "Mining": ["ADRO", "ITMG", "ANTM"],
@@ -477,7 +479,6 @@ def calculate_final_confidence(ai_score, smart_status, macro_status, best_sector
         if ticker.replace(".JK","") in stocks and sector == best_sector:
             confidence += 5
 
-    # Pastikan dalam rentang 0–100
     confidence = max(0, min(100, confidence))
     return confidence
 
@@ -553,7 +554,7 @@ st.markdown(f"""
 
 st.markdown("---")
 
-# ========== TABS (SEKARANG 9 TAB) ==========
+# ========== TABS ==========
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "📈 Grafik", "🤖 AI Signal", "🔍 Scanner", "📁 Portfolio",
     "🧪 Backtest & ML", "📖 Info", "🏦 Smart Money", "🌍 Macro Market", "🔄 Sector Flow"
@@ -597,7 +598,7 @@ with tab1:
     with col_cmf:
         st.line_chart(data['CMF'])
 
-# ========== TAB 2: AI SIGNAL (DIPERKUAT) ==========
+# ========== TAB 2: AI SIGNAL ==========
 with tab2:
     score = calculate_ai_score(data, volume)
 
@@ -910,59 +911,107 @@ with tab4:
     else:
         st.info("Masukkan modal, risiko, dan stop loss untuk menghitung.")
 
-# ========== TAB 5: BACKTEST & ML ==========
+# ========== TAB 5: BACKTEST & ML (DITINGKATKAN) ==========
 with tab5:
     st.header("🧪 Backtesting & Machine Learning")
     
-    # Backtesting
-    st.subheader("📈 Backtest Strategi (RSI < 35 & Harga > SMA20)")
+    # ========== BACKTEST DENGAN PARAMETER ==========
+    st.subheader("📈 Backtest Strategi (RSI + SMA)")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        rsi_buy = st.slider("RSI Buy Threshold", min_value=20, max_value=45, value=35, step=1)
+    with col2:
+        rsi_sell = st.slider("RSI Sell Threshold", min_value=60, max_value=85, value=70, step=1)
+    with col3:
+        sma_period = st.slider("SMA Period", min_value=10, max_value=50, value=20, step=5)
+    
+    commission = st.checkbox("Include Commission (0.1% per trade)", value=True)
+    commission_rate = 0.001 if commission else 0
+    
     with st.spinner("Menjalankan backtest..."):
-        bt_result = backtest_strategy(data)
+        bt_result = backtest_strategy(data, rsi_buy=rsi_buy, rsi_sell=rsi_sell, sma_period=sma_period, commission=commission_rate)
+    
     if bt_result:
-        st.metric("Total Return", f"{bt_result['total_return']:.2f}%", delta=f"{bt_result['total_return']:.2f}%")
-        st.metric("Jumlah Transaksi", bt_result['num_trades'])
+        col_ret, col_trades, col_bh = st.columns(3)
+        col_ret.metric("Total Return", f"{bt_result['total_return']:.2f}%", delta=f"{bt_result['total_return']:.2f}%")
+        col_trades.metric("Jumlah Transaksi", bt_result['num_trades'])
+        col_bh.metric("Buy & Hold Return", f"{bt_result['bh_return']:.2f}%", delta=f"{bt_result['bh_return']:.2f}%")
         st.write(f"**Modal Akhir:** Rp {bt_result['final_capital']:,.2f}")
+        
+        # Equity Curve
+        st.subheader("📈 Equity Curve")
+        equity_df = pd.DataFrame({'Date': data.index[:len(bt_result['equity_curve'])], 'Equity': bt_result['equity_curve']})
+        fig_eq = go.Figure()
+        fig_eq.add_trace(go.Scatter(x=equity_df['Date'], y=equity_df['Equity'], mode='lines', name='Equity'))
+        fig_eq.update_layout(title="Pertumbuhan Modal", xaxis_title="Tanggal", yaxis_title="Nilai (Rp)")
+        st.plotly_chart(fig_eq, use_container_width=True)
+        
         with st.expander("Lihat Detail Transaksi"):
-            st.dataframe(pd.DataFrame(bt_result['trades'], columns=['Tipe', 'Tanggal', 'Harga']))
+            if bt_result['trades']:
+                st.dataframe(pd.DataFrame(bt_result['trades'], columns=['Tipe', 'Tanggal', 'Harga']))
+            else:
+                st.info("Tidak ada transaksi.")
     else:
-        # Pesan yang jelas jika data tidak cukup
-        if len(data) < 50:
-            st.warning(f"Data tidak cukup untuk backtest. Minimal 50 baris, saat ini hanya {len(data)} baris.")
-        else:
-            st.warning("Backtest gagal. Pastikan data memiliki kolom Close, Volume, dan indikator yang diperlukan.")
+        st.warning(f"Data tidak cukup untuk backtest. Minimal 50 baris, saat ini {len(data)} baris.")
     
     st.divider()
     
-    # Machine Learning
-    st.subheader("🤖 Machine Learning Prediction (Random Forest)")
+    # ========== MACHINE LEARNING DENGAN WALK-FORWARD ==========
+    st.subheader("🤖 Machine Learning Prediction (Walk-Forward Validation)")
+    
     if SKLEARN_AVAILABLE:
-        X, y = prepare_ml_features(data)
-        if X is not None and len(X) > 50:
-            # Split data (waktu berurutan)
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, shuffle=False)
-            model = RandomForestClassifier(n_estimators=100, random_state=42)
-            model.fit(X_train, y_train)
-            acc = accuracy_score(y_test, model.predict(X_test))
-            st.metric("Akurasi Model (Test)", f"{acc:.2%}")
+        # Parameter ML
+        lookback = st.slider("Prediction Horizon (hari)", min_value=1, max_value=10, value=5, step=1)
+        target_pct = st.slider("Target Return (%)", min_value=0.5, max_value=5.0, value=1.0, step=0.5) / 100.0
+        
+        X, y = prepare_ml_features(data, lookback=lookback, target_pct=target_pct)
+        
+        if X is not None and len(X) > 100:
+            # Walk-forward validation (rolling window)
+            window_size = 200
+            accuracies = []
+            last_model = None
+            for i in range(window_size, len(X) - 50, 50):
+                train_X = X.iloc[i-window_size:i]
+                train_y = y.iloc[i-window_size:i]
+                test_X = X.iloc[i:i+50]
+                test_y = y.iloc[i:i+50]
+                if len(train_X) < 100 or len(test_X) < 10:
+                    continue
+                model = RandomForestClassifier(n_estimators=100, random_state=42)
+                model.fit(train_X, train_y)
+                pred = model.predict(test_X)
+                acc = accuracy_score(test_y, pred)
+                accuracies.append(acc)
+                last_model = model  # keep last model for latest prediction
+            
+            avg_acc = np.mean(accuracies) if accuracies else 0
+            st.metric("Average Walk-Forward Accuracy", f"{avg_acc:.2%}")
+            st.caption("Akurasi rata-rata dari rolling window validasi.")
+            
             # Prediksi untuk hari ini
-            latest = X.iloc[-1:].values
-            prob = model.predict_proba(latest)[0][1]
-            st.write(f"**Probabilitas harga naik >1% dalam 5 hari:** {prob:.2%}")
-            # Feature importance
-            if st.checkbox("Tampilkan Feature Importance"):
-                importance = pd.DataFrame({'Feature': X.columns, 'Importance': model.feature_importances_})
+            if last_model is not None:
+                latest = X.iloc[-1:].values
+                prob = last_model.predict_proba(latest)[0][1]
+                st.metric(f"Probabilitas harga naik >{target_pct*100:.1f}% dalam {lookback} hari", f"{prob:.2%}")
+            else:
+                st.info("Belum ada model yang terbentuk, coba gunakan data yang lebih panjang.")
+            
+            # Feature Importance
+            if st.checkbox("Tampilkan Feature Importance") and last_model is not None:
+                importance = pd.DataFrame({'Feature': X.columns, 'Importance': last_model.feature_importances_})
                 st.bar_chart(importance.set_index('Feature'))
         else:
-            if len(data) < 100:
-                st.warning(f"Data tidak cukup untuk melatih model. Minimal 100 baris, saat ini {len(data)} baris.")
+            if len(data) < 200:
+                st.warning(f"Data tidak cukup untuk ML. Minimal 200 baris, saat ini {len(data)} baris.")
             else:
-                st.warning("Data tidak cukup setelah preprocessing (mungkin karena missing values).")
+                st.warning("Data tidak cukup setelah preprocessing. Pastikan volume tersedia (saham biasa, bukan indeks).")
     else:
         st.error("❌ Machine learning tidak tersedia karena library 'scikit-learn' tidak terinstal. Install dengan: pip install scikit-learn")
     
     st.divider()
     
-    # Sentimen Berita (Diversifikasi)
+    # ========== SENTIMEN BERITA ==========
     st.subheader("📰 Sentimen Berita (Diversifikasi)")
     if FEEDPARSER_AVAILABLE and TEXTBLOB_AVAILABLE:
         with st.spinner("Mengambil sentimen berita..."):
@@ -1007,7 +1056,6 @@ with tab6:
     
     st.divider()
     
-    # Opsional: tampilkan sentimen juga di tab info jika tersedia
     if FEEDPARSER_AVAILABLE and TEXTBLOB_AVAILABLE:
         st.subheader("📰 Diversifikasi Sinyal: Sentimen Berita Terkini")
         sentiment = get_news_sentiment()
@@ -1029,8 +1077,8 @@ with tab6:
         **Risk Reward Ratio**: Target/risk > 2 = good setup  
         **AI Score** 4-5: Strong Buy, 3: Hold, 0-2: Sell  
         **FINAL DECISION** score ≥3: Accumulate, =2: Wait, ≤1: Avoid
-        **Backtest**: Menguji strategi RSI + SMA pada data historis  
-        **Machine Learning**: Prediksi probabilitas kenaikan harga >1% dalam 5 hari
+        **Backtest**: Menguji strategi RSI + SMA pada data historis, sekarang dengan parameter custom dan komisi
+        **Machine Learning**: Prediksi probabilitas kenaikan harga dengan fitur momentum, volume change, ATR dan validasi walk-forward
         **Multi Timeframe**: Bullish jika harga > SMA20 di daily, weekly, monthly
         **Smart Money**: Akumulasi jika CMF>0, AD naik, volume spike, price>MA20
         **Macro**: Risk ON jika IHSG naik, USD turun, Nasdaq naik
@@ -1053,7 +1101,6 @@ with tab7:
         else:
             st.info("Netral, belum ada sinyal kuat.")
         
-        # Breakdown
         st.subheader("Komponen Score")
         cmf_ok = data['CMF'].iloc[-1] > 0
         ad_ok = data['AD'].iloc[-1] > data['AD'].iloc[-5]
@@ -1080,7 +1127,6 @@ with tab8:
     else:
         st.info("Netral.")
     
-    # Tampilkan data mentah
     try:
         ihsg = yf.download("^JKSE", period="5d", progress=False)['Close']
         usd = yf.download("USDIDR=X", period="5d", progress=False)['Close']
